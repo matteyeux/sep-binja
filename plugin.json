@@ -1,0 +1,20 @@
+{
+    "pluginmetadataversion": 2,
+    "name": "SEP Firmware Loader",
+    "type": ["binaryview"],
+    "api": ["python3"],
+    "description": "Loads Apple SEP firmware, splitting it into individually addressed Mach-O modules",
+    "longdescription": "Parses the Legion2/Legion2P SEP firmware header, extracts every embedded Mach-O (boot stub, kernel, SEPOS root-server, all SEP apps, shared library), maps each one at a distinct 4 GiB-aligned virtual address range, creates properly typed sections, adds entry points and LIEF-derived symbols, and optionally resolves shared-library GOT references.",
+    "license": {
+        "name": "GPL-3.0-or-later"
+    },
+    "platforms": ["Darwin", "Linux", "Windows"],
+    "installinstructions": {
+        "Darwin": "pip3 install lief",
+        "Linux": "pip3 install lief",
+        "Windows": "pip3 install lief"
+    },
+    "version": "1.0.0",
+    "author": "sepsplit-rs / sep-dyld-ida authors",
+    "minimumbinaryninjaversion": 3505
+}
