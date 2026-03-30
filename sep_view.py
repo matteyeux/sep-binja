@@ -41,6 +41,32 @@ from .macho_helpers import (
 # 4 GiB gap between every module
 RELOC_STEP: int = 0x100000000
 
+_LC_CMD_TYPES: dict[int, str] = {
+    0x02: "symtab_command",  # LC_SYMTAB
+    0x0B: "dysymtab_command",  # LC_DYSYMTAB
+    0x0C: "dylib_command",  # LC_LOAD_DYLIB
+    0x0D: "dylib_command",  # LC_ID_DYLIB
+    0x0E: "dylinker_command",  # LC_LOAD_DYLINKER
+    0x0F: "dylinker_command",  # LC_ID_DYLINKER
+    0x19: "segment_command_64",  # LC_SEGMENT_64
+    0x1B: "uuid_command",  # LC_UUID
+    0x1D: "linkedit_data_command",  # LC_CODE_SIGNATURE
+    0x1E: "linkedit_data_command",  # LC_SEGMENT_SPLIT_INFO
+    0x22: "dyld_info_command",  # LC_DYLD_INFO
+    0x24: "linkedit_data_command",  # LC_DYLD_CHAINED_FIXUPS (older)
+    0x26: "linkedit_data_command",  # LC_FUNCTION_STARTS
+    0x29: "linkedit_data_command",  # LC_DATA_IN_CODE
+    0x2A: "source_version_command",  # LC_SOURCE_VERSION
+    0x32: "build_version_command",  # LC_BUILD_VERSION
+    0x80000022: "dyld_info_command",  # LC_DYLD_INFO_ONLY
+    0x80000028: "entry_point_command",  # LC_MAIN
+    0x80000033: "linkedit_data_command",  # LC_DYLD_EXPORTS_TRIE
+    0x80000034: "linkedit_data_command",  # LC_DYLD_CHAINED_FIXUPS
+    0x08000001: "sep_shlib_chain_command",  # LC_SEP_SHLIB_CHAIN
+    0x08000002: "sep_chained_fixup_command",  # LC_SEP_CHAINED_FIXUPS
+    0x08000003: "sep_prebind_slide_command",  # LC_SEP_PREBIND_SLIDE
+}
+
 
 _CODE_SECTION_NAMES = frozenset(
     {
@@ -142,6 +168,8 @@ class SEPFirmwareView(BinaryView):
                         f"[SEP] shared-lib slide = {shlib_slide:#x}, base = {shlib_base:#x}"
                     )
                 break
+
+        self._define_macho_header_types()
 
         for mod in modules:
             log_info(f"[SEP] loading {mod.kind:6s}  {mod.name}")
@@ -246,6 +274,13 @@ class SEPFirmwareView(BinaryView):
             SectionSemantics.ReadOnlyDataSectionSemantics,
         )
 
+        mach_hdr_type = self.get_type_by_name("mach_header_64")
+        if mach_hdr_type is not None:
+            self.define_data_var(hdr_va_start, mach_hdr_type, f"{mod.name}_mach_header")
+
+        raw_hdr = fw[mod.phys_text : mod.phys_text + hdr_size]
+        self._apply_macho_load_commands(hdr_va_start, raw_hdr)
+
         text_start_va, text_end_va = None, None
 
         for seg in binary.segments:
@@ -317,6 +352,302 @@ class SEPFirmwareView(BinaryView):
             if sym_va == module_base:
                 continue
             self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, sym_va, sym_name))
+
+    def _define_macho_header_types(self) -> None:
+        """Define mach_header_64 and all common Mach-O load command types."""
+        u8 = Type.int(1, False)
+        u32 = Type.int(4, False)
+        i32 = Type.int(4, True)
+        u64 = Type.int(8, False)
+
+        def _s(*fields: tuple) -> Type:
+            """Build a packed structure type from (type, name) pairs."""
+            b = StructureBuilder.create()
+            b.packed = True
+            for t, name in fields:
+                b.append(t, name)
+            return Type.structure_type(b)
+
+        char16 = Type.array(Type.char(), 16)
+
+        self.define_user_type(
+            "mach_header_64",
+            _s(
+                (u32, "magic"),
+                (i32, "cputype"),
+                (i32, "cpusubtype"),
+                (u32, "filetype"),
+                (u32, "ncmds"),
+                (u32, "sizeofcmds"),
+                (u32, "flags"),
+                (u32, "reserved"),
+            ),
+        )
+
+        self.define_user_type(
+            "load_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+            ),
+        )
+
+        self.define_user_type(
+            "segment_command_64",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (char16, "segname"),
+                (u64, "vmaddr"),
+                (u64, "vmsize"),
+                (u64, "fileoff"),
+                (u64, "filesize"),
+                (i32, "maxprot"),
+                (i32, "initprot"),
+                (u32, "nsects"),
+                (u32, "flags"),
+            ),
+        )
+
+        self.define_user_type(
+            "section_64",
+            _s(
+                (char16, "sectname"),
+                (char16, "segname"),
+                (u64, "addr"),
+                (u64, "size"),
+                (u32, "offset"),
+                (u32, "align"),
+                (u32, "reloff"),
+                (u32, "nreloc"),
+                (u32, "flags"),
+                (u32, "reserved1"),
+                (u32, "reserved2"),
+                (u32, "reserved3"),
+            ),
+        )
+
+        self.define_user_type(
+            "symtab_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u32, "symoff"),
+                (u32, "nsyms"),
+                (u32, "stroff"),
+                (u32, "strsize"),
+            ),
+        )
+
+        self.define_user_type(
+            "dysymtab_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u32, "ilocalsym"),
+                (u32, "nlocalsym"),
+                (u32, "iextdefsym"),
+                (u32, "nextdefsym"),
+                (u32, "iundefsym"),
+                (u32, "nundefsym"),
+                (u32, "tocoff"),
+                (u32, "ntoc"),
+                (u32, "modtaboff"),
+                (u32, "nmodtab"),
+                (u32, "extrefsymoff"),
+                (u32, "nextrefsyms"),
+                (u32, "indirectsymoff"),
+                (u32, "nindirectsyms"),
+                (u32, "extreloff"),
+                (u32, "nextrel"),
+                (u32, "locreloff"),
+                (u32, "nlocrel"),
+            ),
+        )
+
+        # dylib_command fixed header, the library name string follows at
+        # the byte offset stored in the `name` lc_str field
+        self.define_user_type(
+            "dylib_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u32, "name"),
+                (u32, "timestamp"),
+                (u32, "current_version"),
+                (u32, "compatibility_version"),
+            ),
+        )
+
+        self.define_user_type(
+            "dylinker_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u32, "name"),
+            ),
+        )
+
+        self.define_user_type(
+            "uuid_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (Type.array(u8, 16), "uuid"),
+            ),
+        )
+
+        self.define_user_type(
+            "entry_point_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u64, "entryoff"),
+                (u64, "stacksize"),
+            ),
+        )
+
+        self.define_user_type(
+            "linkedit_data_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u32, "dataoff"),
+                (u32, "datasize"),
+            ),
+        )
+
+        self.define_user_type(
+            "source_version_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u64, "version"),
+            ),
+        )
+
+        self.define_user_type(
+            "build_version_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u32, "platform"),
+                (u32, "minos"),
+                (u32, "sdk"),
+                (u32, "ntools"),
+            ),
+        )
+
+        self.define_user_type(
+            "build_tool_version",
+            _s(
+                (u32, "tool"),
+                (u32, "version"),
+            ),
+        )
+
+        self.define_user_type(
+            "dyld_info_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u32, "rebase_off"),
+                (u32, "rebase_size"),
+                (u32, "bind_off"),
+                (u32, "bind_size"),
+                (u32, "weak_bind_off"),
+                (u32, "weak_bind_size"),
+                (u32, "lazy_bind_off"),
+                (u32, "lazy_bind_size"),
+                (u32, "export_off"),
+                (u32, "export_size"),
+            ),
+        )
+
+        # SEP-specific load commands
+        self.define_user_type(
+            "sep_shlib_chain_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (i32, "offset"),
+                (u32, "flags"),
+            ),
+        )
+
+        self.define_user_type(
+            "sep_chained_fixup_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (u32, "flags"),
+            ),
+        )
+
+        self.define_user_type(
+            "sep_prebind_slide_command",
+            _s(
+                (u32, "cmd"),
+                (u32, "cmdsize"),
+                (i32, "slide"),
+                (u32, "flags"),
+            ),
+        )
+
+    def _apply_macho_load_commands(self, hdr_va_start: int, raw_hdr: bytes) -> None:
+        """Walk load commands in raw_hdr and apply struct annotations in the view."""
+        if len(raw_hdr) < 32:
+            return
+        magic = struct.unpack_from("<I", raw_hdr, 0)[0]
+        is64 = magic == 0xFEEDFACF
+        lc_start = 32 if is64 else 28
+        ncmds = struct.unpack_from("<I", raw_hdr, 16)[0]
+
+        sect64_type = self.get_type_by_name("section_64")
+        p = lc_start
+        for _ in range(ncmds):
+            if p + 8 > len(raw_hdr):
+                break
+            cmd, csz = struct.unpack_from("<II", raw_hdr, p)
+            if csz < 8:
+                break
+
+            type_name = _LC_CMD_TYPES.get(cmd, "load_command")
+            lc_type = self.get_type_by_name(type_name)
+            if lc_type is not None:
+                self.define_data_var(hdr_va_start + p, lc_type)
+
+            # Annotate each section_64 that follows a LC_SEGMENT_64
+            if cmd == 0x19 and sect64_type is not None and p + 72 <= len(raw_hdr):
+                nsects = struct.unpack_from("<I", raw_hdr, p + 64)[0]
+                for i in range(nsects):
+                    sect_off = p + 72 + i * 80
+                    if sect_off + 80 > len(raw_hdr):
+                        break
+                    self.define_data_var(hdr_va_start + sect_off, sect64_type)
+
+            # Annotate build_tool_version entries that trail build_version_command
+            if cmd == 0x32 and p + 24 <= len(raw_hdr):
+                ntools = struct.unpack_from("<I", raw_hdr, p + 20)[0]
+                tool_type = self.get_type_by_name("build_tool_version")
+                if tool_type is not None:
+                    for i in range(ntools):
+                        tool_off = p + 24 + i * 8
+                        if tool_off + 8 > len(raw_hdr):
+                            break
+                        self.define_data_var(hdr_va_start + tool_off, tool_type)
+
+            # Annotate the name string that trails dylib_command / dylinker_command
+            if cmd in (0x0C, 0x0D, 0x0E, 0x0F) and p + 12 <= len(raw_hdr):
+                name_off = struct.unpack_from("<I", raw_hdr, p + 8)[0]
+                str_size = csz - name_off
+                if 0 < str_size <= csz and name_off + str_size <= len(raw_hdr) - p:
+                    self.define_data_var(
+                        hdr_va_start + p + name_off,
+                        Type.array(Type.char(), str_size),
+                    )
+
+            p += csz
 
     def _define_firmware_types(self, fw: bytes) -> None:
         """Define SEPFW bootargs, SEPRootserver and SEPApp64 types and apply them.
