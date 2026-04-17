@@ -466,6 +466,9 @@ class SEPFirmwareView(BinaryView):
 
                 self.add_auto_section(sect_name, sect_va, sect_size, semantics)
 
+                if sect.name == "__text":
+                    self._seed_text_functions(sect_va, sect_size, sect_fw_off, fw)
+
                 if sect.name in ("__mod_init_func", "__init_offsets", "__auth_ptr"):
                     self._fix_init_funcs(
                         sect_va, sect_size, module_base + imagebase, fw, sect_fw_off
@@ -498,7 +501,13 @@ class SEPFirmwareView(BinaryView):
             sym_va = module_base + sym_value
             if sym_va == module_base:
                 continue
-            self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, sym_va, sym_name))
+            if self.is_offset_executable(sym_va):
+                self.define_auto_symbol(
+                    Symbol(SymbolType.FunctionSymbol, sym_va, sym_name)
+                )
+                self.add_function(sym_va)
+            else:
+                self.define_auto_symbol(Symbol(SymbolType.DataSymbol, sym_va, sym_name))
 
     def _define_macho_header_types(self) -> None:
         """Define mach_header_64 and all common Mach-O load command types."""
@@ -973,6 +982,30 @@ class SEPFirmwareView(BinaryView):
             f"[SEP] applied Legion64BootArgs at {BOOT_START:#x} "
             f"({n_apps} apps + {n_shlibs} shlibs)"
         )
+
+    def _seed_text_functions(self, va: int, size: int, fw_off: int, fw: bytes) -> None:
+        """Sweep a code section for ARM64(/ARM64e) function prologues and add
+        each match as a function. Catches functions not reachable from the
+        entry point or symbol table — common in stripped SEP modules where
+        LC_FUNCTION_STARTS has been dropped.
+        """
+        n = size // 4
+        end = min(fw_off + n * 4, len(fw))
+        added = 0
+        addr = va
+        for off in range(fw_off, end, 4):
+            instr = struct.unpack_from("<I", fw, off)[0]
+            # paciasp / pacibsp (ARM64e PAC prologue)
+            is_prologue = instr in (0xD503233F, 0xD503237F)
+            # stp x29, x30, [sp, #-N]!  (mask out the imm7 field)
+            if not is_prologue and (instr & 0xFFC0FFFF) == 0xA9807BFD:
+                is_prologue = True
+            if is_prologue:
+                self.add_function(addr)
+                added += 1
+            addr += 4
+        if added:
+            log_info(f"[SEP] seeded {added} functions in {va:#x}+{size:#x}")
 
     def _map_raw(
         self, fw_offset: int, va: int, size: int, section_name: str, flags: SegmentFlag
