@@ -30,6 +30,18 @@ from .firmware_parser import (
 )
 from .macho_helpers import (
     MachOBinary,
+    S_4BYTE_LITERALS,
+    S_8BYTE_LITERALS,
+    S_16BYTE_LITERALS,
+    S_ATTR_PURE_INSTRUCTIONS,
+    S_CSTRING_LITERALS,
+    S_INIT_FUNC_OFFSETS,
+    S_LAZY_SYMBOL_POINTERS,
+    S_LITERAL_POINTERS,
+    S_MOD_INIT_FUNC_POINTERS,
+    S_MOD_TERM_FUNC_POINTERS,
+    S_NON_LAZY_SYMBOL_POINTERS,
+    S_SYMBOL_STUBS,
     compute_shared_cache_slide,
     find_lc_sep_slide,
     fw_offset_for,
@@ -68,14 +80,18 @@ _LC_CMD_TYPES: dict[int, str] = {
 }
 
 
-_CODE_SECTION_NAMES = frozenset(
+_RODATA_SECTION_TYPES = frozenset(
     {
-        "__text",
-        "__auth_stubs",
-        "__stubs",
-        "__stub_helper",
-        "__textcoal_nt",
-        "__symbol_stub",
+        S_CSTRING_LITERALS,
+        S_4BYTE_LITERALS,
+        S_8BYTE_LITERALS,
+        S_16BYTE_LITERALS,
+        S_LITERAL_POINTERS,
+        S_NON_LAZY_SYMBOL_POINTERS,
+        S_LAZY_SYMBOL_POINTERS,
+        S_MOD_INIT_FUNC_POINTERS,
+        S_MOD_TERM_FUNC_POINTERS,
+        S_INIT_FUNC_OFFSETS,
     }
 )
 
@@ -93,10 +109,19 @@ def _seg_flags(seg) -> SegmentFlag:
 
 
 def _section_semantics(sect) -> SectionSemantics:
+    """Pick semantics from the section's Mach-O type/attribute flags.
+
+    Type nibble (low 8 bits) is authoritative for known kinds; the
+    S_ATTR_PURE_INSTRUCTIONS attribute marks pure code. Fall back to
+    segment-name heuristics for S_REGULAR, which relies on convention.
+    """
     if sect.is_zerofill:
         return SectionSemantics.ReadWriteDataSectionSemantics
-    if sect.name in _CODE_SECTION_NAMES:
+    stype = sect.sect_type
+    if stype == S_SYMBOL_STUBS or (sect.flags & S_ATTR_PURE_INSTRUCTIONS):
         return SectionSemantics.ReadOnlyCodeSectionSemantics
+    if stype in _RODATA_SECTION_TYPES:
+        return SectionSemantics.ReadOnlyDataSectionSemantics
     seg_name = sect.segment_name
     if seg_name in (
         "__DATA",
@@ -107,9 +132,7 @@ def _section_semantics(sect) -> SectionSemantics:
         "__LEGION",
     ):
         return SectionSemantics.ReadWriteDataSectionSemantics
-    if seg_name == "__DATA_CONST":
-        return SectionSemantics.ReadOnlyDataSectionSemantics
-    if seg_name == "__TEXT":
+    if seg_name in ("__DATA_CONST", "__TEXT"):
         return SectionSemantics.ReadOnlyDataSectionSemantics
     return SectionSemantics.DefaultSectionSemantics
 
@@ -118,16 +141,42 @@ class SEPFirmwareView(BinaryView):
     name = "SEP Firmware"
     long_name = "Apple SEP Firmware"
 
+    # Registry so UI-side code (triage view) can recover the original
+    # Python instance — the wrapper handed to ViewType.create does not
+    # carry Python-subclass attributes like modules / load_module.
+    _instances: "dict[str, SEPFirmwareView]" = {}
+
     @classmethod
     def is_valid_for_data(cls, data: BinaryView) -> bool:
         raw = data.read(0, 0x1200)
         return is_sep_firmware(bytes(raw))
+
+    @classmethod
+    def for_view(cls, view) -> "SEPFirmwareView | None":
+        try:
+            fname = view.file.filename if view.file else None
+        except Exception:
+            fname = None
+        return cls._instances.get(fname) if fname else None
 
     def __init__(self, data: BinaryView) -> None:
         BinaryView.__init__(self, file_metadata=data.file, parent_view=data)
         self.arch = Architecture["aarch64"]
         self.platform = self.arch.standalone_platform
         self.data = data
+        self.modules: list[SepModule] = []
+        self.reloc_step: int = RELOC_STEP
+        self._fw: bytes = b""
+        self._shlib_base: int = 0
+        self._shlib_slide: int = 0
+        self._loaded_module_keys: set = set()
+        self._imagebase_cache: dict[int, int] = {}
+        try:
+            fname = self.file.filename if self.file else None
+        except Exception:
+            fname = None
+        if fname:
+            SEPFirmwareView._instances[fname] = self
 
     def perform_get_address_size(self) -> int:
         return 8
@@ -135,54 +184,147 @@ class SEPFirmwareView(BinaryView):
     def init(self) -> bool:
         self._plat = self.platform
         try:
-            return self._load()
+            return self._init_lazy()
         except Exception:
             log_error(f"[SEP] load failed:\n{traceback.format_exc()}")
             return False
 
-    def _load(self) -> bool:
-        self.binary = self.data.read(0, self.data.length)
+    def _init_lazy(self) -> bool:
+        """Parse the firmware header but don't map any module bytes.
+
+        Per-module mapping is deferred to load_module() / load_all() so the
+        triage view can open without kicking off a full analysis.
+        """
         self.arch = Architecture["aarch64"]
         self.platform = self.arch.standalone_platform
 
-        fw_size = self.data.length
-        fw = bytes(self.parent_view.read(0, fw_size))
+        fw = bytes(self.parent_view.read(0, self.parent_view.length))
+        self._fw = fw
 
-        log_info("[SEP] parsing firmware…")
+        log_info("[SEP] parsing firmware header…")
         modules = extract_all_modules(fw)
         log_info(f"[SEP] found {len(modules)} modules")
+        self.modules = modules
+        self.reloc_step = RELOC_STEP
 
-        # Locate the shared library first so we have its base address and
-        # slide ready before processing the apps that reference it
-        shlib_base = 0
-        shlib_slide = 0
-        for mod in modules:
+        self._compute_shlib_slide(fw)
+        self._define_macho_header_types()
+
+        try:
+            header_end = self._compute_legion_end(fw)
+            if header_end > 0:
+                self._map_firmware_header(header_end)
+                self._define_firmware_types(fw)
+        except Exception:
+            log_warn(
+                f"[SEP] could not annotate firmware header:\n{traceback.format_exc()}"
+            )
+
+        return True
+
+    def _compute_shlib_slide(self, fw: bytes) -> None:
+        for mod in self.modules:
             if mod.is_shlib and mod.is_macho:
-                shlib_base = RELOC_STEP * mod.binja_idx
+                self._shlib_base = RELOC_STEP * mod.binja_idx
                 lc_off = find_lc_sep_slide(
                     fw[mod.phys_text : mod.phys_text + mod.size_text]
                 )
                 if lc_off is not None:
-                    shlib_slide = compute_shared_cache_slide(lc_off, mod.virt or 0x8000)
+                    self._shlib_slide = compute_shared_cache_slide(
+                        lc_off, mod.virt or 0x8000
+                    )
                     log_info(
-                        f"[SEP] shared-lib slide = {shlib_slide:#x}, base = {shlib_base:#x}"
+                        f"[SEP] shared-lib slide = {self._shlib_slide:#x}, "
+                        f"base = {self._shlib_base:#x}"
                     )
                 break
 
-        self._define_macho_header_types()
+    def _compute_legion_end(self, fw: bytes) -> int:
+        """Firmware byte offset covering the full Legion64BootArgs struct
+        (rounded up to a page). Used to size the lazy header segment."""
+        hdr_offset, ver = find_off(fw)
+        if ver < 3:
+            return 0
+        is_old = hdr_offset == 0xFFFF
+        if is_old:
+            hdr_offset = 0x10F8
+        hdr = _parse_sephdr64(fw, hdr_offset, ver, is_old)
+        srcver_major = get_srcver_major(hdr["srcver"])
+        apps_off = hdr["_apps_off"]
+        n_apps = hdr["n_apps"]
+        n_shlibs = hdr["n_shlibs"]
+        if n_apps == 0:
+            apps_off += 0x100
+            n_apps = struct.unpack_from("<I", fw, hdr_offset + 0x210)[0]
+            n_shlibs = struct.unpack_from("<I", fw, hdr_offset + 0x214)[0]
+        stride = _sepapp_stride(srcver_major, is_old)
+        end = apps_off + stride * (n_apps + n_shlibs)
+        return (end + 0xFFF) & ~0xFFF
 
-        for mod in modules:
-            log_info(f"[SEP] loading {mod.kind:6s}  {mod.name}")
-            self._load_module(fw, mod, shlib_base, shlib_slide)
+    def _map_firmware_header(self, size: int) -> None:
+        self.add_auto_segment(
+            0,
+            size,
+            0,
+            size,
+            SegmentFlag.SegmentReadable | SegmentFlag.SegmentContainsData,
+        )
+        self.add_auto_section(
+            "SEPFW_HEADER",
+            0,
+            size,
+            SectionSemantics.ReadOnlyDataSectionSemantics,
+        )
 
+    def load_module(self, mod: SepModule) -> bool:
+        """Map one module's bytes and trigger analysis for it.
+
+        Returns True if newly loaded, False if it was already loaded.
+        """
+        key = (mod.binja_idx, mod.kind, mod.name)
+        if key in self._loaded_module_keys:
+            return False
+        log_info(f"[SEP] loading {mod.kind:6s}  {mod.name}")
         try:
-            self._define_firmware_types(fw)
+            self._load_module(self._fw, mod, self._shlib_base, self._shlib_slide)
         except Exception:
-            log_warn(
-                f"[SEP] could not annotate firmware types:\n{traceback.format_exc()}"
-            )
-
+            log_error(f"[SEP] failed to load '{mod.name}':\n{traceback.format_exc()}")
+            return False
+        self._loaded_module_keys.add(key)
+        self.update_analysis()
         return True
+
+    def load_all(self) -> None:
+        for mod in self.modules:
+            self.load_module(mod)
+
+    def is_module_loaded(self, mod: SepModule) -> bool:
+        return (mod.binja_idx, mod.kind, mod.name) in self._loaded_module_keys
+
+    def module_display_va(self, mod: SepModule) -> int:
+        """VA where the module's header lands in the view.
+
+        For Mach-O modules this is module_base + imagebase (from the Mach-O's
+        own __TEXT vmaddr). For raw modules (boot, raw kernel) it's the
+        physical firmware offset.
+        """
+        if mod.kind == "boot":
+            return 0
+        if not mod.is_macho:
+            return mod.phys_text
+        module_base = RELOC_STEP * mod.binja_idx
+        imagebase = self._imagebase_cache.get(mod.binja_idx)
+        if imagebase is None:
+            imagebase = 0
+            try:
+                raw_text = self._fw[mod.phys_text : mod.phys_text + mod.size_text]
+                binary = parse_macho(raw_text)
+                if binary is not None:
+                    imagebase = binary.imagebase
+            except Exception:
+                pass
+            self._imagebase_cache[mod.binja_idx] = imagebase
+        return module_base + imagebase
 
     def _load_module(
         self, fw: bytes, mod: SepModule, shlib_base: int, shlib_slide: int
@@ -277,6 +419,11 @@ class SEPFirmwareView(BinaryView):
         mach_hdr_type = self.get_type_by_name("mach_header_64")
         if mach_hdr_type is not None:
             self.define_data_var(hdr_va_start, mach_hdr_type, f"{mod.name}_mach_header")
+
+        if binary.libraries:
+            comment = "Libraries:\n" + "\n".join(f"  {lib}" for lib in binary.libraries)
+            self.set_comment_at(hdr_va_start, comment)
+            log_info(f"[SEP] {mod.name}: {len(binary.libraries)} dylib dependencies")
 
         raw_hdr = fw[mod.phys_text : mod.phys_text + hdr_size]
         self._apply_macho_load_commands(hdr_va_start, raw_hdr)

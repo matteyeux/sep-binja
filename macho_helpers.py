@@ -10,18 +10,57 @@ from typing import Optional
 LC_SEGMENT = 0x00000001
 LC_SYMTAB = 0x00000002
 LC_UNIXTHREAD = 0x00000005
+LC_LOAD_DYLIB = 0x0000000C
+LC_ID_DYLIB = 0x0000000D
+LC_LOAD_WEAK_DYLIB = 0x80000018
+LC_REEXPORT_DYLIB = 0x8000001F
+LC_LAZY_LOAD_DYLIB = 0x00000020
+LC_LOAD_UPWARD_DYLIB = 0x80000023
 LC_SEGMENT_64 = 0x00000019
 LC_MAIN = 0x80000028
 
 # SEP load commands
 LC_SEP_SEGMENT = 0x80000001
 
-# Section type constants
+# Section type constants (low 8 bits of section.flags)
+S_REGULAR = 0x00
 S_ZEROFILL = 0x01
+S_CSTRING_LITERALS = 0x02
+S_4BYTE_LITERALS = 0x03
+S_8BYTE_LITERALS = 0x04
+S_LITERAL_POINTERS = 0x05
+S_NON_LAZY_SYMBOL_POINTERS = 0x06
+S_LAZY_SYMBOL_POINTERS = 0x07
+S_SYMBOL_STUBS = 0x08
+S_MOD_INIT_FUNC_POINTERS = 0x09
+S_MOD_TERM_FUNC_POINTERS = 0x0A
+S_COALESCED = 0x0B
 S_GB_ZEROFILL = 0x0C
+S_INTERPOSING = 0x0D
+S_16BYTE_LITERALS = 0x0E
+S_DTRACE_DOF = 0x0F
+S_LAZY_DYLIB_SYMBOL_POINTERS = 0x10
+S_THREAD_LOCAL_REGULAR = 0x11
 S_THREAD_LOCAL_ZEROFILL = 0x12
+S_THREAD_LOCAL_VARIABLES = 0x13
+S_THREAD_LOCAL_VARIABLE_POINTERS = 0x14
+S_THREAD_LOCAL_INIT_FUNCTION_POINTERS = 0x15
+S_INIT_FUNC_OFFSETS = 0x16
 SECTION_TYPE_MASK = 0xFF
 
+# Section attribute bits (high 24 bits of section.flags)
+S_ATTR_PURE_INSTRUCTIONS = 0x80000000
+S_ATTR_SOME_INSTRUCTIONS = 0x00000400
+
+_DYLIB_CMDS = frozenset(
+    {
+        LC_LOAD_DYLIB,
+        LC_LOAD_WEAK_DYLIB,
+        LC_REEXPORT_DYLIB,
+        LC_LAZY_LOAD_DYLIB,
+        LC_LOAD_UPWARD_DYLIB,
+    }
+)
 _ZEROFILL_TYPES = frozenset({S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL})
 
 
@@ -61,6 +100,7 @@ class MachOBinary:
     entry_pc: Optional[int]  # raw PC from LC_UNIXTHREAD
     entry_main: Optional[int]  # entrypoint offset from LC_MAIN
     symbols: list[tuple[str, int]]  # (name, vm_value)
+    libraries: list[str] = field(default_factory=list)  # LC_LOAD_DYLIB names
 
 
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -87,6 +127,7 @@ def parse_macho(data: bytes) -> Optional[MachOBinary]:
     sym_offset: Optional[int] = None
     sym_count: int = 0
     str_offset: Optional[int] = None
+    libraries: list[str] = []
 
     for _ in range(ncmds):
         if p + 8 > len(data):
@@ -140,6 +181,18 @@ def parse_macho(data: bytes) -> Optional[MachOBinary]:
                 "<IIII", data, p + 8
             )
 
+        elif cmd in _DYLIB_CMDS and p + 24 <= len(data):
+            (name_off,) = struct.unpack_from("<I", data, p + 8)
+            if 0 < name_off < csz:
+                start = p + name_off
+                end_limit = p + csz
+                end = data.find(b"\x00", start, end_limit)
+                if end == -1:
+                    end = end_limit
+                name = data[start:end].decode("ascii", errors="replace").rstrip()
+                if name:
+                    libraries.append(name)
+
         p += csz
 
     non_pz = [s for s in segments if s.name != "__PAGEZERO"]
@@ -147,7 +200,7 @@ def parse_macho(data: bytes) -> Optional[MachOBinary]:
 
     symbols = _parse_symbols(data, sym_offset, sym_count, str_offset)
 
-    return MachOBinary(imagebase, segments, entry_pc, entry_main, symbols)
+    return MachOBinary(imagebase, segments, entry_pc, entry_main, symbols, libraries)
 
 
 def _cstr(b: bytes) -> str:
