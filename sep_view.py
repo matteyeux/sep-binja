@@ -808,7 +808,9 @@ class SEPFirmwareView(BinaryView):
     def _define_firmware_types(self, fw: bytes) -> None:
         """Define SEPFW bootargs, SEPRootserver and SEPApp64 types and apply them.
 
-        Legion64BootArgs is applied at 0x1000 (the hardware header base).
+        Legion64BootArgs is applied at 0x0 (the start of the firmware): the
+        struct begins with boot_instructions/boot_vectors (0x000-0xFFF) and the
+        legion header proper starts at +0x1000.
         SEPApp64 instances are applied at apps_off, apps_off+stride, …
         """
         hdr_offset, ver = find_off(fw)
@@ -819,8 +821,9 @@ class SEPFirmwareView(BinaryView):
         if is_old:
             hdr_offset = 0x10F8
 
-        # Legion64 header always starts at 0x1000 before it's boot insts and reset vector
-        BOOT_START: int = 0x1000
+        # Full Legion64 struct starts at offset 0; bootstrap code + reset
+        # vectors occupy 0x000-0xFFF, legion header begins at 0x1000.
+        BOOT_START: int = 0x0
 
         hdr = _parse_sephdr64(fw, hdr_offset, ver, is_old)
         srcver_major = get_srcver_major(hdr["srcver"])
@@ -903,27 +906,33 @@ class SEPFirmwareView(BinaryView):
         # ── Legion64BootArgs — built with insert() so BN pads unknown gaps ────
         #
         # Verified field positions for Legion64 (ver==4) in j236c:
-        #   +0x00  uuid_offset
-        #   +0x08  astris_uuid[16]
-        #   +0x18  unknown 32 bytes (seprom_boot_args_v2 / memory_map prefix)
-        #   +0x38  subversion          ┐
-        #   +0x3c  legion_string[16]   │ legion_version
-        #   +0x4c  sepos_boot_args_offset │
-        #   +0x4e  __reserved[2]       ┘
-        #   +0x50 … hdr_rel-1   unknown (rest of seprom + memory_map)
+        #   +0x0000 boot_instructions[256]   bootstrap code  (0x000-0x7ff)
+        #   +0x0800 boot_vectors[256]        reset vectors   (0x800-0xfff)
+        #   +0x1000 uuid_offset
+        #   +0x1008 astris_uuid[16]
+        #   +0x1018 unknown 32 bytes (seprom_boot_args_v2 / memory_map prefix)
+        #   +0x1038 subversion          ┐
+        #   +0x103c legion_string[16]   │ legion_version
+        #   +0x104c sepos_boot_args_offset │
+        #   +0x104e __reserved[2]       ┘
+        #   +0x1050 … hdr_rel-1   unknown (rest of seprom + memory_map)
         #   hdr_rel = hdr_offset - BOOT_START   ← sepos_boot_args begins here
         #
         # ~merci le Claude
         b = StructureBuilder.create()
         hdr_rel = hdr_offset - BOOT_START
 
+        # bootstrap code + reset vectors (precede the legion header)
+        b.insert(0x000, Type.array(u64, 256), "boot_instructions")
+        b.insert(0x800, Type.array(u64, 256), "boot_vectors")
+
         # header
-        b.insert(0x00, u64, "uuid_offset")
-        b.insert(0x08, Type.array(u8, 16), "astris_uuid")
-        b.insert(0x38, u32, "subversion")
-        b.insert(0x3C, Type.array(Type.char(), 16), "legion_string")
-        b.insert(0x4C, u16, "sepos_boot_args_offset")
-        b.insert(0x4E, Type.array(u8, 2), "_legion_reserved")
+        b.insert(0x1000, u64, "uuid_offset")
+        b.insert(0x1008, Type.array(u8, 16), "astris_uuid")
+        b.insert(0x1038, u32, "subversion")
+        b.insert(0x103C, Type.array(Type.char(), 16), "legion_string")
+        b.insert(0x104C, u16, "sepos_boot_args_offset")
+        b.insert(0x104E, Type.array(u8, 2), "_legion_reserved")
 
         # sepos_boot_args
         p = hdr_rel
