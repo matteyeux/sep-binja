@@ -1,7 +1,7 @@
 {
     "pluginmetadataversion": 2,
     "name": "SEP Firmware Loader",
-    "type": ["binaryview"],
+    "type": ["binaryview", "ui"],
     "api": ["python3"],
     "description": "Loads Apple SEP firmware, splitting it into individually addressed Mach-O modules",
     "longdescription": "Parses the Legion2 SEP firmware header, extracts every embedded Mach-O (boot stub, kernel, SEPOS root-server, all SEP apps, shared library), maps each one at a distinct 4 GiB-aligned virtual address range, creates properly typed sections, adds entry points, symbols, and optionally resolves shared-library GOT references. No external dependencies.",
