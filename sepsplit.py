@@ -126,9 +126,11 @@ def fix_data_segment(image: bytearray, data: bytes, dataoff: int | None) -> None
         if cmd != LC_SEGMENT_64:
             continue
         if _seg_name(image[body : body + 16]) == SEG_DATA:
-            off = dataoff if dataoff is not None else struct.unpack_from(
-                "<Q", image, body + 32
-            )[0]
+            off = (
+                dataoff
+                if dataoff is not None
+                else struct.unpack_from("<Q", image, body + 32)[0]
+            )
             image[off : off + len(data)] = data
 
 
