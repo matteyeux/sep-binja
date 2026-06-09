@@ -15,6 +15,12 @@ SEPAPP_64_SIZE = 128
 
 MACHO_MAGIC_64 = 0xFEEDFACF
 
+# Source-version major at/after which SEPApp64 gained an extra u64 (_unk5)
+# right after compact_ver_end. Empirically: d84 (3151) has no field, d38 (3485)
+# has it. The exact Apple boundary is unknown; adjust if a firmware between
+# these majors disagrees.
+SEPAPP_UNK5_SRCVER_MAJOR = 3400
+
 
 @dataclass
 class SepModule:
@@ -204,7 +210,9 @@ def _parse_sephdr64(data: bytes, hdr_offset: int, ver: int, is_old: bool) -> dic
     )
 
 
-def _parse_sepapp64(data: bytes, off: int, ver: int, is_old: bool) -> dict:
+def _parse_sepapp64(
+    data: bytes, off: int, ver: int, is_old: bool, srcver_major: int = 0
+) -> dict:
     """Parse one SEPApp64 entry at *off* and return a field dict."""
     p = off
 
@@ -233,6 +241,10 @@ def _parse_sepapp64(data: bytes, off: int, ver: int, is_old: bool) -> dict:
         p += 8 * 4  # _unk1 .. _unk4
 
     p += 4 + 4  # compact_ver_start, compact_ver_end
+
+    if srcver_major >= SEPAPP_UNK5_SRCVER_MAJOR:
+        p += 8  # _unk5 (added in d38-era firmware)
+
     app_name = data[p : p + 16]
     p += 16
     app_uuid = data[p : p + 16]
@@ -268,6 +280,8 @@ def _sepapp_stride(srcver_major: int, is_old: bool) -> int:
         size += 36
     elif srcver_major >= 1700:
         size += 4
+    if srcver_major >= SEPAPP_UNK5_SRCVER_MAJOR:
+        size += 8  # _unk5 field after compact_ver_end
     return size
 
 
@@ -401,7 +415,7 @@ def extract_all_modules(data: bytes) -> list[SepModule]:
     # apps
     off = apps_off
     for i in range(n_apps):
-        app = _parse_sepapp64(data, off, ver, is_old)
+        app = _parse_sepapp64(data, off, ver, is_old, srcver_major)
         modules.append(
             SepModule(
                 kind="app",
@@ -422,7 +436,7 @@ def extract_all_modules(data: bytes) -> list[SepModule]:
 
     # shlibs
     for i in range(n_shlibs):
-        app = _parse_sepapp64(data, off, ver, is_old)
+        app = _parse_sepapp64(data, off, ver, is_old, srcver_major)
         modules.append(
             SepModule(
                 kind="shlib",

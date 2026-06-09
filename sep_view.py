@@ -20,6 +20,7 @@ from binaryninja import (
 )
 
 from .firmware_parser import (
+    SEPAPP_UNK5_SRCVER_MAJOR,
     SepModule,
     _parse_sephdr64,
     _sepapp_stride,
@@ -291,12 +292,33 @@ class SEPFirmwareView(BinaryView):
             log_error(f"[SEP] failed to load '{mod.name}':\n{traceback.format_exc()}")
             return False
         self._loaded_module_keys.add(key)
+        self._reapply_firmware_struct()
         self.update_analysis()
         return True
 
     def load_all(self) -> None:
         for mod in self.modules:
             self.load_module(mod)
+        self._reapply_firmware_struct()
+
+    def _reapply_firmware_struct(self) -> None:
+        """Re-apply Legion64BootArgs at offset 0.
+
+        Loading the boot module overlays va=0 with code-semantics segments
+        and adds an entry point at 0, which causes analysis to create a
+        function there. We must undefine that code (and any prior data var)
+        before re-defining the struct, otherwise the data annotation does
+        not stick.
+        """
+        legion = self.get_type_by_name("Legion64BootArgs")
+        if legion is None:
+            return
+        for func in self.get_functions_at(0):
+            self.remove_user_function(func)
+            self.remove_function(func)
+        self.undefine_user_data_var(0)
+        self.undefine_data_var(0)
+        self.define_user_data_var(0, legion)
 
     def is_module_loaded(self, mod: SepModule) -> bool:
         return (mod.binja_idx, mod.kind, mod.name) in self._loaded_module_keys
@@ -870,6 +892,8 @@ class SEPFirmwareView(BinaryView):
             af("_unk4", u64, 8)
         af("compact_ver_start", u32, 4)
         af("compact_ver_end", u32, 4)
+        if srcver_major >= SEPAPP_UNK5_SRCVER_MAJOR:
+            af("_unk5", u64, 8)
         af("app_name", Type.array(Type.char(), 16), 16)
         af("app_uuid", Type.array(Type.char(), 16), 16)
         if not is_old:
