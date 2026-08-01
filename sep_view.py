@@ -171,6 +171,7 @@ class SEPFirmwareView(BinaryView):
         self._shlib_base: int = 0
         self._shlib_slide: int = 0
         self._loaded_module_keys: set = set()
+        self._loaded_keys_restored: bool = False
         self._imagebase_cache: dict[int, int] = {}
         try:
             fname = self.file.filename if self.file else None
@@ -181,6 +182,12 @@ class SEPFirmwareView(BinaryView):
 
     def perform_get_address_size(self) -> int:
         return 8
+
+    def perform_is_executable(self) -> bool:
+        # Defaults to False for custom views, which hides this view from any
+        # UI or plugin that gates on BinaryView.executable (the diff view's
+        # ViewType among them).
+        return True
 
     def init(self) -> bool:
         self._plat = self.platform
@@ -282,6 +289,7 @@ class SEPFirmwareView(BinaryView):
 
         Returns True if newly loaded, False if it was already loaded.
         """
+        self._ensure_loaded_keys()
         key = (mod.binja_idx, mod.kind, mod.name)
         if key in self._loaded_module_keys:
             return False
@@ -292,6 +300,7 @@ class SEPFirmwareView(BinaryView):
             log_error(f"[SEP] failed to load '{mod.name}':\n{traceback.format_exc()}")
             return False
         self._loaded_module_keys.add(key)
+        self._persist_loaded_modules()
         self._reapply_firmware_struct()
         self.update_analysis()
         return True
@@ -300,6 +309,40 @@ class SEPFirmwareView(BinaryView):
         for mod in self.modules:
             self.load_module(mod)
         self._reapply_firmware_struct()
+
+    #: Metadata key recording which modules the user loaded. Only bookkeeping
+    #: for the triage UI: the segments themselves are user segments, which
+    #: Binary Ninja saves into the .bndb and restores on its own. Metadata is
+    #: not reliably readable during init(), so it is only consulted lazily.
+    _LOADED_MODULES_KEY = "sep.loaded_modules"
+
+    def _persist_loaded_modules(self) -> None:
+        self.store_metadata(
+            self._LOADED_MODULES_KEY,
+            [
+                {"idx": idx, "kind": kind, "name": name}
+                for idx, kind, name in sorted(self._loaded_module_keys)
+            ],
+        )
+
+    def _ensure_loaded_keys(self) -> None:
+        """Merge the loaded-module set saved in a reopened database.
+
+        In that case the module segments already exist — Binary Ninja restored
+        them with the rest of the user state — so this only refreshes the
+        bookkeeping that keeps load_module() idempotent and the triage view's
+        loaded column truthful.
+        """
+        if self._loaded_keys_restored:
+            return
+        self._loaded_keys_restored = True
+        saved = self.get_metadata(self._LOADED_MODULES_KEY)
+        if not saved:
+            return
+        for entry in saved:
+            self._loaded_module_keys.add(
+                (int(entry["idx"]), str(entry["kind"]), str(entry["name"]))
+            )
 
     def _reapply_firmware_struct(self) -> None:
         """Re-apply Legion64BootArgs at offset 0.
@@ -321,6 +364,7 @@ class SEPFirmwareView(BinaryView):
         self.define_user_data_var(0, legion)
 
     def is_module_loaded(self, mod: SepModule) -> bool:
+        self._ensure_loaded_keys()
         return (mod.binja_idx, mod.kind, mod.name) in self._loaded_module_keys
 
     def module_display_va(self, mod: SepModule) -> int:
@@ -424,14 +468,19 @@ class SEPFirmwareView(BinaryView):
             s.offset for seg in binary.segments for s in seg.sections if s.offset > 0
         ]
         hdr_size = min(all_offsets) if all_offsets else 0x100
-        self.add_auto_segment(
+        # Modules are mapped as *user* segments/sections throughout: auto ones
+        # are never saved into a database, and with lazy loading there is no
+        # init()-time code that could re-create them on reopen — the saved
+        # functions would land on unbacked addresses and be discarded. User
+        # segments are part of the saved state Binary Ninja restores itself.
+        self.add_user_segment(
             hdr_va_start,
             hdr_size,
             mod.phys_text,
             hdr_size,
             SegmentFlag.SegmentReadable | SegmentFlag.SegmentContainsData,
         )
-        self.add_auto_section(
+        self.add_user_section(
             f"{mod.name}:HEADER",
             hdr_va_start,
             hdr_size,
@@ -467,7 +516,7 @@ class SEPFirmwareView(BinaryView):
             )
             seg_flags = _seg_flags(seg)
 
-            self.add_auto_segment(
+            self.add_user_segment(
                 seg_va,
                 seg_vsz,
                 seg_fw_off,
@@ -486,7 +535,7 @@ class SEPFirmwareView(BinaryView):
                 semantics = _section_semantics(sect)
                 sect_name = f"{mod.name}:{sect.segment_name}:{sect.name}"
 
-                self.add_auto_section(sect_name, sect_va, sect_size, semantics)
+                self.add_user_section(sect_name, sect_va, sect_size, semantics)
 
                 if sect.name == "__text":
                     self._seed_text_functions(sect_va, sect_size, sect_fw_off, fw)
@@ -1043,13 +1092,13 @@ class SEPFirmwareView(BinaryView):
     def _map_raw(
         self, fw_offset: int, va: int, size: int, section_name: str, flags: SegmentFlag
     ) -> None:
-        self.add_auto_segment(va, size, fw_offset, size, flags)
+        self.add_user_segment(va, size, fw_offset, size, flags)
         semantics = (
             SectionSemantics.ReadOnlyCodeSectionSemantics
             if flags & SegmentFlag.SegmentContainsCode
             else SectionSemantics.DefaultSectionSemantics
         )
-        self.add_auto_section(section_name, va, size, semantics)
+        self.add_user_section(section_name, va, size, semantics)
 
     def _fix_init_funcs(
         self, va: int, size: int, imagebase: int, fw: bytes, fw_off: int
