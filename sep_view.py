@@ -215,6 +215,16 @@ class SEPFirmwareView(BinaryView):
         self.modules = modules
         self.reloc_step = RELOC_STEP
 
+        # Publish this instance so other plugins can drive load_module: they
+        # only ever get a generic BinaryView wrapper, which has no way back to
+        # the Python object the core built. See sep_api.
+        try:
+            from .sep_api import register_view
+
+            register_view(self)
+        except Exception:  # pragma: no cover - never worth failing a load over
+            pass
+
         self._compute_shlib_slide(fw)
         self._define_macho_header_types()
 
