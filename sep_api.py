@@ -29,9 +29,10 @@ import ctypes
 import sys
 import weakref
 
-#: 2 added load_all_modules. Bumped when the functions below change shape. A consumer should check it
+#: 2 added load_all_modules, 3 load_modules. Bumped when the functions below
+#: change shape. A consumer should check it
 #: rather than assume, since the two plugins are versioned separately.
-API_VERSION = 2
+API_VERSION = 3
 
 #: Where this module publishes itself, independent of the folder the plugin
 #: happens to be installed under (Binary Ninja keys plugin modules by directory
@@ -110,20 +111,37 @@ def load_module(bv, name: str) -> bool:
     return True
 
 
-def load_all_modules(bv) -> bool:
-    """Map every module in the image and analyze once, at the end.
+def load_modules(bv, names) -> bool:
+    """Map several modules, then analyze once.
 
-    Analyzing after each module would re-run the whole view a couple of dozen
-    times over; a caller wanting the whole firmware pays for it once here.
+    Not a convenience wrapper around load_module: Binary Ninja sweeps a view
+    on its *first* analysis only, so a module mapped after one has completed
+    contributes just what recursive descent reaches from an entry point.
+    Measured over a whole 26-module image, one module at a time against all of
+    them first: 26959 functions against 31499. Map everything you mean to
+    analyze before anything settles the view.
     """
 
     view = view_for(bv)
     if view is None:
         return False
-    for module in view.modules:
+    wanted = set(names)
+    modules = [module for module in view.modules if module.name in wanted]
+    if len(modules) != len(wanted):
+        return False
+    for module in modules:
         view.load_module(module)
     view.update_analysis_and_wait()
     return True
+
+
+def load_all_modules(bv) -> bool:
+    """Map every module in the image and analyze once, at the end."""
+
+    view = view_for(bv)
+    if view is None:
+        return False
+    return load_modules(bv, [module.name for module in view.modules])
 
 
 def publish() -> None:

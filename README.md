@@ -17,6 +17,24 @@ Also defined structs in the BinaryView.
 
 
 
+### Headless analysis
+
+`sep-analyze.py` loads a firmware, maps the modules you ask for and writes a
+`.bndb` — no GUI, no clicking through the triage view for every image:
+
+```bash
+./sep-analyze.py --list sep-firmware.bin        # what is in it
+./sep-analyze.py -m SEPOS -m SEPD sep-firmware.bin
+./sep-analyze.py --all sep-firmware.bin -o sep-26.5.bndb
+./sep-analyze.py sep-firmware.bin               # asks which modules
+```
+
+Run it with the interpreter Binary Ninja's API is installed in; it needs a
+headless licence. Modules are mapped **before** the analysis runs, which is not
+cosmetic: Binary Ninja analyzes a view once, and a SEP image starts empty, so
+analyzing first leaves the modules with only what recursive descent reaches —
+26896 functions against 31499 on the same 26-module image.
+
 ### Install
 
 - MacOS: Copy to `~/Library/Application Support/Binary Ninja/plugins/` or use Plugin Manager
