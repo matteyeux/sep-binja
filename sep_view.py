@@ -20,14 +20,15 @@ from binaryninja import (
 )
 
 from .firmware_parser import (
-    SEPAPP_UNK5_SRCVER_MAJOR,
+    ASTRIS_UUID_BASE,
+    LEGION_MARKER,
+    SEPAPP_EXTRA_MEM_SRCVER_MAJOR,
+    LegionLayout,
     SepModule,
-    _parse_sephdr64,
-    _sepapp_stride,
     extract_all_modules,
-    find_off,
-    get_srcver_major,
+    find_astris_uuid,
     is_sep_firmware,
+    parse_legion_layout,
 )
 from .macho_helpers import (
     MachOBinary,
@@ -260,24 +261,10 @@ class SEPFirmwareView(BinaryView):
     def _compute_legion_end(self, fw: bytes) -> int:
         """Firmware byte offset covering the full Legion64BootArgs struct
         (rounded up to a page). Used to size the lazy header segment."""
-        hdr_offset, ver = find_off(fw)
-        if ver < 3:
+        layout = parse_legion_layout(fw)
+        if layout is None:
             return 0
-        is_old = hdr_offset == 0xFFFF
-        if is_old:
-            hdr_offset = 0x10F8
-        hdr = _parse_sephdr64(fw, hdr_offset, ver, is_old)
-        srcver_major = get_srcver_major(hdr["srcver"])
-        apps_off = hdr["_apps_off"]
-        n_apps = hdr["n_apps"]
-        n_shlibs = hdr["n_shlibs"]
-        if n_apps == 0:
-            apps_off += 0x100
-            n_apps = struct.unpack_from("<I", fw, hdr_offset + 0x210)[0]
-            n_shlibs = struct.unpack_from("<I", fw, hdr_offset + 0x214)[0]
-        stride = _sepapp_stride(srcver_major, is_old)
-        end = apps_off + stride * (n_apps + n_shlibs)
-        return (end + 0xFFF) & ~0xFFF
+        return (layout.apps_end + 0xFFF) & ~0xFFF
 
     def _map_firmware_header(self, size: int) -> None:
         self.add_auto_segment(
@@ -371,7 +358,7 @@ class SEPFirmwareView(BinaryView):
             self.remove_function(func)
         self.undefine_user_data_var(0)
         self.undefine_data_var(0)
-        self.define_user_data_var(0, legion)
+        self.define_user_data_var(0, legion, self._LEGION_SYMBOL)
 
     def is_module_loaded(self, mod: SepModule) -> bool:
         self._ensure_loaded_keys()
@@ -886,41 +873,48 @@ class SEPFirmwareView(BinaryView):
 
             p += csz
 
+    #: Name given to the Legion64BootArgs data variable at offset 0.
+    _LEGION_SYMBOL = "legion_boot_args"
+
+    #: SEP_MEMORY_REGION_COUNT — TZ0/scheme2, TZ0/scheme3, TZ1/scheme2 and
+    #: key-context-1/scheme3, in that order.
+    _MEMORY_REGION_COUNT = 4
+
+    #: The widths seprom_boot_args_v2 can have. SEPROM compiles two tails in
+    #: conditionally — CONFIG_PLATFORM_SEPROM_HIBERNATION_ARGS adds the
+    #: hibernation seed, CONFIG_EEPROM_LYNX >= 3 the epoch slots — and nothing
+    #: in the image says which are there except how much room legion left for
+    #: the struct. iOS 18 (d38) has neither, iOS 26 has both.
+    _SEPROM_ARGS_BASE_SIZE = 0xC0
+    _SEPROM_ARGS_HIB_SIZE = 0xE0
+    _SEPROM_ARGS_EPOCH_SIZE = 0x108
+
     def _define_firmware_types(self, fw: bytes) -> None:
         """Define SEPFW bootargs, SEPRootserver and SEPApp64 types and apply them.
 
         Legion64BootArgs is applied at 0x0 (the start of the firmware): the
-        struct begins with boot_instructions/boot_vectors (0x000-0xFFF) and the
-        legion header proper starts at +0x1000.
-        SEPApp64 instances are applied at apps_off, apps_off+stride, …
+        struct begins with boot_instructions/boot_vectors (0x000-0xFFF), the
+        legion header proper starts at +0x1000, and the SEPApp64 array is the
+        struct's last member, so every app entry is annotated with it.
         """
-        hdr_offset, ver = find_off(fw)
-        if ver < 3:
+        layout = parse_legion_layout(fw)
+        if layout is None:
             return  # ver-2 layout not worth annotating
-
-        is_old = hdr_offset == 0xFFFF
-        if is_old:
-            hdr_offset = 0x10F8
 
         # Full Legion64 struct starts at offset 0; bootstrap code + reset
         # vectors occupy 0x000-0xFFF, legion header begins at 0x1000.
         BOOT_START: int = 0x0
 
-        hdr = _parse_sephdr64(fw, hdr_offset, ver, is_old)
-        srcver_major = get_srcver_major(hdr["srcver"])
-        apps_off = hdr["_apps_off"]
-        n_apps = hdr["n_apps"]
-        n_shlibs = hdr["n_shlibs"]
-
-        if n_apps == 0:
-            apps_off += 0x100
-            n_apps = struct.unpack_from("<I", fw, hdr_offset + 0x210)[0]
-            n_shlibs = struct.unpack_from("<I", fw, hdr_offset + 0x214)[0]
-
-        stride = _sepapp_stride(srcver_major, is_old)
+        hdr_offset = layout.hdr_offset
+        ver = layout.ver
+        is_old = layout.is_old
+        hdr = layout.hdr
+        srcver_major = layout.srcver_major
+        n_apps = layout.n_apps
+        n_shlibs = layout.n_shlibs
+        stride = layout.stride
 
         u8 = Type.int(1, False)
-        u16 = Type.int(2, False)
         u32 = Type.int(4, False)
         u64 = Type.int(8, False)
 
@@ -943,26 +937,46 @@ class SEPFirmwareView(BinaryView):
         if not is_old:
             af("mem_size", u64, 8)
             af("non_ar_mem_size", u64, 8)
+        has_extra_mem = srcver_major >= SEPAPP_EXTRA_MEM_SRCVER_MAJOR
         if ver == 4:
             af("heap_mem_size", u64, 8)
-            af("_unk1", u64, 8)
-            af("_unk2", u64, 8)
-            af("_unk3", u64, 8)
-            af("_unk4", u64, 8)
+            # These four were _unk1.._unk4. _boot_file_descriptor64 names them,
+            # and the values agree: thread_count is a small count that tracks
+            # the app, and cnode_count is 0 everywhere, which the header calls
+            # out as "for now unused".
+            af("virtual_memory_size", u64, 8)
+            af("dart_memory_size", u64, 8)
+            if has_extra_mem:
+                # iOS 27 wedged a fourth memory size in here — not after
+                # compact_ver_end, which is where this used to put it, and which
+                # slid the next three fields a slot out of place. 0 for every
+                # app but eispAppl_d7x, which drives the ISP.
+                af("_unk_memory_size", u64, 8)
+            af("thread_count", u64, 8)
+            af("cnode_count", u64, 8)
+        elif has_extra_mem:
+            af("_unk_memory_size", u64, 8)
         af("compact_ver_start", u32, 4)
         af("compact_ver_end", u32, 4)
-        if srcver_major >= SEPAPP_UNK5_SRCVER_MAJOR:
-            af("_unk5", u64, 8)
         af("app_name", Type.array(Type.char(), 16), 16)
-        af("app_uuid", Type.array(Type.char(), 16), 16)
+        # Raw bytes, not a string: rendered as char[16] a UUID comes out as
+        # sixteen columns of escape sequences.
+        af("app_uuid", Type.array(u8, 16), 16)
         if not is_old:
             af("srcver", u64, 8)
-        if stride > app_sz[0]:
-            a.append(Type.array(u8, stride - app_sz[0]), "_pad")
+        leftover = stride - app_sz[0]
+        if leftover == 4:
+            # APP_FLAG_SHARED_LIBRARY / APP_FLAG_PREBOUND. Reads 1 for every
+            # shlib and 2 for every app across iOS 18, 26 and 27, which is what
+            # confirms the tail of this struct is aligned the way it looks.
+            a.append(u32, "flags")
+        elif leftover > 0:
+            a.append(Type.array(u8, leftover), "_pad")
 
         self.define_user_type("SEPApp64", Type.structure_type(a))
 
         rs = StructureBuilder.create()
+        rs.packed = True
         rs.append(u64, "phys_base")
         rs.append(u64, "virt_base")
         rs.append(u64, "virt_size")
@@ -979,7 +993,9 @@ class SEPFirmwareView(BinaryView):
             rs.append(u64, "dart_memory_size")
             rs.append(u64, "thread_count")
             rs.append(u64, "cnode_count")
-        rs.append(Type.array(u8, 16), "name")
+        # char[16], per struct rootserver: it holds a name ("SEPOS"), and as
+        # uint8_t[16] Binary Ninja shows the reader its bytes one per line.
+        rs.append(Type.array(Type.char(), 16), "name")
         rs.append(Type.array(u8, 16), "uuid")
         if not is_old:
             rs.append(u64, "source_version")
@@ -991,14 +1007,7 @@ class SEPFirmwareView(BinaryView):
         # Verified field positions for Legion64 (ver==4) in j236c:
         #   +0x0000 boot_instructions[256]   bootstrap code  (0x000-0x7ff)
         #   +0x0800 boot_vectors[256]        reset vectors   (0x800-0xfff)
-        #   +0x1000 uuid_offset
-        #   +0x1008 astris_uuid[16]
-        #   +0x1018 unknown 32 bytes (seprom_boot_args_v2 / memory_map prefix)
-        #   +0x1038 subversion          ┐
-        #   +0x103c legion_string[16]   │ legion_version
-        #   +0x104c sepos_boot_args_offset │
-        #   +0x104e __reserved[2]       ┘
-        #   +0x1050 … hdr_rel-1   unknown (rest of seprom + memory_map)
+        #   +0x1000 … hdr_rel-1  legion header, see _insert_legion_header
         #   hdr_rel = hdr_offset - BOOT_START   ← sepos_boot_args begins here
         #
         # ~merci le Claude
@@ -1009,13 +1018,7 @@ class SEPFirmwareView(BinaryView):
         b.insert(0x000, Type.array(u64, 256), "boot_instructions")
         b.insert(0x800, Type.array(u64, 256), "boot_vectors")
 
-        # header
-        b.insert(0x1000, u64, "uuid_offset")
-        b.insert(0x1008, Type.array(u8, 16), "astris_uuid")
-        b.insert(0x1038, u32, "subversion")
-        b.insert(0x103C, Type.array(Type.char(), 16), "legion_string")
-        b.insert(0x104C, u16, "sepos_boot_args_offset")
-        b.insert(0x104E, Type.array(u8, 2), "_legion_reserved")
+        self._insert_legion_header(b, fw, layout)
 
         # sepos_boot_args
         p = hdr_rel
@@ -1069,10 +1072,194 @@ class SEPFirmwareView(BinaryView):
         )
 
         self.define_user_type("Legion64BootArgs", Type.structure_type(b))
-        self.define_user_data_var(BOOT_START, self.get_type_by_name("Legion64BootArgs"))
+        self.define_user_data_var(
+            BOOT_START,
+            self.get_type_by_name("Legion64BootArgs"),
+            self._LEGION_SYMBOL,
+        )
         log_info(
             f"[SEP] applied Legion64BootArgs at {BOOT_START:#x} "
             f"({n_apps} apps + {n_shlibs} shlibs)"
+        )
+
+    def _define_astris_uuid_type(self) -> Type:
+        """astris_uuid_t: the struct astris looks in to find the kernel UUID.
+
+        Its magic is 'uuid' — the four bytes that read as a stray string in the
+        middle of the header — and the sixteen bytes after the two version
+        words are the kernel UUID, the same one sepos_boot_args opens with.
+        """
+        u8 = Type.int(1, False)
+        u32 = Type.int(4, False)
+        b = StructureBuilder.create()
+        b.packed = True
+        b.append(u32, "magic")  # 'uuid'
+        b.append(u32, "version")
+        b.append(u32, "rtxc_version")
+        b.append(u32, "client_version")
+        b.append(Type.array(u8, 16), "uuid")
+        b.append(u32, "slide")
+        # Pads the struct out to a 128-bit boundary.
+        b.append(Type.array(u32, 3), "_reserved")
+        self.define_user_type("astris_uuid_t", Type.structure_type(b))
+        # The named reference, not the anonymous structure: a member typed with
+        # the latter renders inline as `struct { ... }` instead of by name.
+        return self.get_type_by_name("astris_uuid_t")
+
+    def _define_memory_region_type(self) -> Type:
+        u64 = Type.int(8, False)
+        b = StructureBuilder.create()
+        b.packed = True
+        b.append(u64, "base")
+        b.append(u64, "size")
+        self.define_user_type("SEPMemoryRegion", Type.structure_type(b))
+        return self.get_type_by_name("SEPMemoryRegion")
+
+    def _define_seprom_boot_args_type(self, size: int) -> Type | None:
+        """seprom_boot_args_v2, or None if *size* is not a width it can have.
+
+        These are SEPROM's boot args, not legion's: every field reads as zero
+        in a firmware file, because SEPROM fills them in on the way up. They
+        are worth naming anyway — this is the layout a live SEP or a memory
+        dump has at this offset.
+        """
+        known = (
+            self._SEPROM_ARGS_BASE_SIZE,
+            self._SEPROM_ARGS_HIB_SIZE,
+            self._SEPROM_ARGS_EPOCH_SIZE,
+        )
+        if size not in known:
+            return None
+
+        u8 = Type.int(1, False)
+        u32 = Type.int(4, False)
+        u64 = Type.int(8, False)
+        b = StructureBuilder.create()
+        b.packed = True
+        b.append(u32, "magic")  # 'SEPB'
+        b.append(u32, "reserved_0")
+        b.append(u32, "version")
+        b.append(u32, "reserved_1")
+        b.append(u32, "size")  # sizeof(seprom_boot_args_v2)
+        b.append(u32, "reserved_2")
+        # TZ0 as the 64-bit fabric sees it
+        b.append(u64, "tz_start")
+        b.append(u32, "tz_size")
+        b.append(u32, "reserved_3")
+        b.append(u32, "payload_tag")  # FourCC from Image4, e.g. 'sepi'
+        b.append(u8, "dfu_status")
+        b.append(Type.array(u8, 3), "reserved_4")
+        b.append(u8, "manifest_hash_valid")
+        b.append(Type.array(u8, 7), "reserved_5")
+        # MF_HASH_SIZE: SHA-384, which is also what keeps the next field aligned
+        b.append(Type.array(u8, 48), "manifest_hash")
+        b.append(u8, "verify_manifest_hash")
+        b.append(Type.array(u8, 7), "reserved_6")
+        b.append(u32, "manifest_offset")
+        b.append(u32, "reserved_7")
+        b.append(u32, "manifest_bytes")
+        b.append(u32, "reserved_8")
+        b.append(Type.array(u8, 64), "entropy")
+
+        if size >= self._SEPROM_ARGS_HIB_SIZE:
+            # Seed for secrets that have to survive a hibernate/resume cycle.
+            b.append(Type.array(u8, 28), "hib_boot_seed")
+            b.append(u32, "reserved_9")
+        if size >= self._SEPROM_ARGS_EPOCH_SIZE:
+            b.append(u8, "nonce_slot_id")  # slot this boot came up on
+            b.append(Type.array(u8, 7), "reserved_10")
+            b.append(Type.array(u8, 32), "epoch_slots")
+
+        self.define_user_type("seprom_boot_args_v2", Type.structure_type(b))
+        return self.get_type_by_name("seprom_boot_args_v2")
+
+    def _insert_legion_header(
+        self, b: StructureBuilder, fw: bytes, layout: LegionLayout
+    ) -> None:
+        """Insert the legion header, 0x1000 up to where sepos_boot_args starts.
+
+        Legion64 (iOS 16+, marker at 0x103C):
+            +0x1000 uuid_offset             where astris_uuid went
+            +0x1008 astris_uuid_t           (0x30 bytes)
+            +0x1038 subversion              ┐
+            +0x103C legion_string[16]       │ legion_version
+            +0x104C sepos_boot_args_offset  │
+            +0x104E _legion_reserved[2]     ┘
+            +0x1050 seprom_boot_args_v2
+            +…      memory_map[4]
+
+        Legion64Old (iOS 15 and below, marker at 0x1004) opens straight at
+        subversion, with no uuid_offset and no astris_uuid. So place the four
+        legion_version fields around the marker, which is the one anchor both
+        layouts share, and let the rest follow from there.
+        """
+        u8 = Type.int(1, False)
+        u16 = Type.int(2, False)
+        u32 = Type.int(4, False)
+
+        if layout.is_legion64:
+            b.insert(0x1000, Type.int(8, False), "uuid_offset")
+            (uuid_offset,) = struct.unpack_from("<Q", fw, 0x1000)
+            self.set_comment_at(
+                0x1000,
+                f"&astris_uuid, relative to boot_vectors ({ASTRIS_UUID_BASE:#x}, "
+                "which the boot stub loads into VBAR_EL1): "
+                f"{ASTRIS_UUID_BASE:#x} + {uuid_offset:#x} = "
+                f"{ASTRIS_UUID_BASE + uuid_offset:#x}",
+            )
+            astris_off = find_astris_uuid(fw)
+            if astris_off is None:
+                # Either the field moved or it is measured from some other
+                # base. Fall back to where every image so far has put it.
+                astris_off = 0x1008
+                log_warn(
+                    "[SEP] uuid_offset does not resolve to an astris_uuid_t; "
+                    f"assuming {astris_off:#x}"
+                )
+            b.insert(astris_off, self._define_astris_uuid_type(), "astris_uuid")
+            self.set_comment_at(
+                astris_off,
+                "magic is 'uuid'; the uuid member is the L4 kernel's, the same "
+                "one sepos_boot_args opens with",
+            )
+
+        marker = layout.marker_off
+        b.insert(marker - 4, u32, "subversion")
+        b.insert(marker, Type.array(Type.char(), len(LEGION_MARKER)), "legion_string")
+        b.insert(marker + len(LEGION_MARKER), u16, "sepos_boot_args_offset")
+        b.insert(marker + len(LEGION_MARKER) + 2, Type.array(u8, 2), "_legion_reserved")
+        legion_end = marker + len(LEGION_MARKER) + 4
+
+        # Everything between the legion header and sepos_boot_args is SEPROM's
+        # boot args followed by the memory map. Only their combined width is
+        # recorded anywhere, so work the split out from it and refuse to guess
+        # if the arithmetic does not come out.
+        region_type = self._define_memory_region_type()
+        memory_map_size = region_type.width * self._MEMORY_REGION_COUNT
+        gap = layout.hdr_offset - legion_end
+        seprom_type = self._define_seprom_boot_args_type(gap - memory_map_size)
+        if seprom_type is None:
+            log_warn(
+                f"[SEP] {gap:#x} bytes between the legion header and "
+                "sepos_boot_args match no known seprom_boot_args_v2 width"
+            )
+            if gap > 0:
+                b.insert(legion_end, Type.array(u8, gap), "_seprom_and_memory_map")
+            return
+        b.insert(legion_end, seprom_type, "seprom_boot_args")
+        self.set_comment_at(
+            legion_end, "filled in by SEPROM — reads as zero in a firmware file"
+        )
+        memory_map_off = legion_end + seprom_type.width
+        b.insert(
+            memory_map_off,
+            Type.array(region_type, self._MEMORY_REGION_COUNT),
+            "memory_map",
+        )
+        self.set_comment_at(
+            memory_map_off,
+            "[0] TZ0 scheme2  [1] TZ0 scheme3  [2] TZ1 scheme2  "
+            "[3] key context 1 scheme3",
         )
 
     def _seed_text_functions(self, va: int, size: int, fw_off: int, fw: bytes) -> None:

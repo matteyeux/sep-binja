@@ -35,6 +35,28 @@ cosmetic: Binary Ninja analyzes a view once, and a SEP image starts empty, so
 analyzing first leaves the modules with only what recursive descent reaches —
 26896 functions against 31499 on the same 26-module image.
 
+### Diffing two firmwares
+
+`sep-diff.py` needs no Binary Ninja at all — it reuses the same header and
+Mach-O parsing to answer what changed between two images:
+
+```bash
+./sep-diff.py sep_26.5.bin sep_27.0.bin       # everything
+./sep-diff.py old.bin new.bin --only sks      # one module
+./sep-diff.py old.bin new.bin --limit 0       # no cap on the lists
+./sep-diff.py old.bin new.bin --json          # for a script
+```
+
+It reports modules added and removed, per-module source-version changes,
+sections and segments that appeared or were resized, dylib dependencies, how
+much of each module's bytes moved, and the ASCII strings gained and lost. Exit
+status is 1 when the images differ, like `diff(1)`.
+
+Build UUIDs are ignored on purpose: every rebuild mints a new one, so counting
+them makes every module of every image pair look changed. A module whose only
+difference is its UUID is reported as unchanged, which is what collapses a point
+release down to the few modules that really moved.
+
 ### Install
 
 - MacOS: Copy to `~/Library/Application Support/Binary Ninja/plugins/` or use Plugin Manager

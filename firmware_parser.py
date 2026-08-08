@@ -15,11 +15,37 @@ SEPAPP_64_SIZE = 128
 
 MACHO_MAGIC_64 = 0xFEEDFACF
 
-# Source-version major at/after which SEPApp64 gained an extra u64 (_unk5)
-# right after compact_ver_end. Empirically: d84 (3151) has no field, d38 (3485)
-# has it. The exact Apple boundary is unknown; adjust if a firmware between
-# these majors disagrees.
-SEPAPP_UNK5_SRCVER_MAJOR = 3400
+#: Build marker legion2 stamps into every image, and the two offsets it lands
+#: at. Which one holds it is the only reliable discriminator between the two
+#: legion header layouts, so everything that needs to tell them apart goes
+#: through legion_marker_offset() rather than re-testing the bytes.
+LEGION_MARKER = b"Built by legion2"
+LEGION_MARKER_OFF = 0x103C  # Legion64     (iOS 16+)
+LEGION_MARKER_OFF_OLD = 0x1004  # Legion64Old  (iOS 15 and below)
+
+#: LEGION64_PAGE_SIZE. Every region legion places starts on one of these, which
+#: makes it the granularity to round the header's end up to when working out
+#: what follows it.
+LEGION64_PAGE_SIZE = 0x4000
+
+#: astris_uuid_t.magic, 'uuid' little-endian: what astris scans an image (or a
+#: live SEP) for to recover the kernel UUID.
+ASTRIS_UUID_MAGIC = 0x64697575
+ASTRIS_UUID_SIZE = 0x30
+
+#: Base that the legion header's uuid_offset is measured from. Not the image
+#: base: the reset-vector array at 0x800, which the four-instruction boot stub
+#: at offset 0 loads into VBAR_EL1 (`adr x2, #0x7fc` / `msr VBAR_EL1, x2`).
+#: 0x800 + uuid_offset lands on astris_uuid — 0x808 → 0x1008 in every image
+#: seen so far, iOS 18 and iOS 26 alike.
+ASTRIS_UUID_BASE = 0x800
+
+# Source-version major at/after which SEPApp64 gained an extra u64: a fourth
+# memory size, between dart_memory_size and thread_count. Empirically: 3151
+# (iOS 26.5, stride 0xa4) has no field, 3485 (iOS 27.0, stride 0xac) has it, and
+# it reads 0 for every app but eispAppl_d7x. The exact Apple boundary is
+# unknown; adjust if a firmware between these majors disagrees.
+SEPAPP_EXTRA_MEM_SRCVER_MAJOR = 3400
 
 
 @dataclass
@@ -42,6 +68,7 @@ class SepModule:
     is_macho: bool
     is_shlib: bool
     binja_idx: int  # multiply by RELOC_STEP to get the BN virtual base
+    srcver: int = 0  # packed SrcVer u64; 0 when the header carries none
 
 
 def get_srcver_major(srcver: int) -> int:
@@ -71,6 +98,18 @@ def is_macho(data: bytes, offset: int = 0) -> bool:
     return magic == MACHO_MAGIC_64
 
 
+def legion_marker_offset(data: bytes) -> int | None:
+    """Offset of the legion2 build marker, or None if the image has none.
+
+    LEGION_MARKER_OFF for the iOS 16+ header, LEGION_MARKER_OFF_OLD for the
+    iOS 15-and-below one.
+    """
+    for off in (LEGION_MARKER_OFF, LEGION_MARKER_OFF_OLD):
+        if data[off : off + len(LEGION_MARKER)] == LEGION_MARKER:
+            return off
+    return None
+
+
 def is_sep_firmware(data: bytes) -> bool:
     """Return True if data looks like a raw 64-bit SEP firmware image."""
     if len(data) < 0x1100:
@@ -81,11 +120,24 @@ def is_sep_firmware(data: bytes) -> bool:
     # LZVN compressed, but we should never branch here it's only for 32 bit
     if data[8:16] == b"eGirBwRD":
         return False
-    # Look for legion2 marker in the expected locations
-    return (
-        data[0x103C : 0x103C + 16] == b"Built by legion2"
-        or data[0x1004 : 0x1004 + 16] == b"Built by legion2"
-    )
+    return legion_marker_offset(data) is not None
+
+
+def find_astris_uuid(data: bytes) -> int | None:
+    """File offset of the astris_uuid_t, or None if it cannot be located.
+
+    The header does not place the struct at a fixed offset; it stores where it
+    put it in uuid_offset, relative to ASTRIS_UUID_BASE. Resolve that rather
+    than assume 0x1008, and only believe the answer if the magic is there.
+    """
+    if legion_marker_offset(data) != LEGION_MARKER_OFF:
+        return None  # the old header has no uuid_offset, and no astris_uuid
+    (uuid_offset,) = struct.unpack_from("<Q", data, 0x1000)
+    off = ASTRIS_UUID_BASE + uuid_offset
+    if off + ASTRIS_UUID_SIZE > len(data):
+        return None
+    (magic,) = struct.unpack_from("<I", data, off)
+    return off if magic == ASTRIS_UUID_MAGIC else None
 
 
 def find_off(data: bytes) -> tuple[int, int]:
@@ -95,29 +147,20 @@ def find_off(data: bytes) -> tuple[int, int]:
     ver == 3 standard 64-bit (iOS 15 and below, Legion64Old)
     ver == 4 modern 64-bit  (iSO 16+, Legion64)
     """
-    if data[0x103C : 0x103C + 16] == b"Built by legion2":
-        # iOS 16+ Legion64
-        p = 0x1000
-        p += 8 + 4 + 8 + 4  # unk1, uuidtext, unk2, unk3
-        p += 16  # uuid
-        p += 8 + 8  # unk4, unk5
-        (subversion,) = struct.unpack_from("<I", data, p)
-        p += 4
-        p += 16  # legionstr
-        (structoff,) = struct.unpack_from("<H", data, p)
-        return int(structoff), int(subversion)
+    marker_off = legion_marker_offset(data)
+    if marker_off is None:
+        raise ValueError("Unrecognised or 32-bit SEP firmware (not supported)")
 
-    if data[0x1004 : 0x1004 + 16] == b"Built by legion2":
-        # iOS 15 and below Legion64Old
-        p = 0x1000
-        (subversion,) = struct.unpack_from("<I", data, p)
-        p += 4
-        p += 16  # legionstr
-        (structoff,) = struct.unpack_from("<H", data, p)
-        off = int(structoff) if structoff != 0 else 0xFFFF
-        return off, int(subversion)
+    # subversion sits immediately before the marker and the SEP data header's
+    # own offset immediately after it, in both layouts. The iOS 16+ header
+    # differs only in what precedes subversion: uuid_offset and astris_uuid.
+    (subversion,) = struct.unpack_from("<I", data, marker_off - 4)
+    (structoff,) = struct.unpack_from("<H", data, marker_off + len(LEGION_MARKER))
 
-    raise ValueError("Unrecognised or 32-bit SEP firmware (not supported)")
+    if marker_off == LEGION_MARKER_OFF_OLD and structoff == 0:
+        # D20-era images leave it blank; the header is at a known fixed offset.
+        return 0xFFFF, int(subversion)
+    return int(structoff), int(subversion)
 
 
 def _parse_sephdr64(data: bytes, hdr_offset: int, ver: int, is_old: bool) -> dict:
@@ -238,12 +281,16 @@ def _parse_sepapp64(
         p += 8  # heap_mem_size
 
     if ver == 4:
-        p += 8 * 4  # _unk1 .. _unk4
+        # virtual_memory_size, dart_memory_size, thread_count, cnode_count
+        p += 8 * 4
+
+    # A fourth memory size, which iOS 27 wedged in between dart_memory_size and
+    # thread_count. Only the total matters here, so it is added at the end of
+    # the run rather than in the middle of it; SEPApp64 in the view places it.
+    if srcver_major >= SEPAPP_EXTRA_MEM_SRCVER_MAJOR:
+        p += 8
 
     p += 4 + 4  # compact_ver_start, compact_ver_end
-
-    if srcver_major >= SEPAPP_UNK5_SRCVER_MAJOR:
-        p += 8  # _unk5 (added in d38-era firmware)
 
     app_name = data[p : p + 16]
     p += 16
@@ -280,9 +327,108 @@ def _sepapp_stride(srcver_major: int, is_old: bool) -> int:
         size += 36
     elif srcver_major >= 1700:
         size += 4
-    if srcver_major >= SEPAPP_UNK5_SRCVER_MAJOR:
-        size += 8  # _unk5 field after compact_ver_end
+    if srcver_major >= SEPAPP_EXTRA_MEM_SRCVER_MAJOR:
+        size += 8  # the extra memory size, new in iOS 27
     return size
+
+
+@dataclass
+class LegionLayout:
+    """Where everything is in a ver >= 3 image, resolved once.
+
+    The walk that produces this — find_off, the SEPDataHDR64 fields, the
+    n_apps == 0 fixup, the SEPApp64 stride — used to be repeated by every
+    caller that needed any part of it, and each copy had to stay in step with
+    the others.
+    """
+
+    marker_off: int  # where the legion2 marker was found
+    hdr_offset: int  # SEPDataHDR64 / sepos_boot_args
+    ver: int  # legion subversion
+    is_old: bool  # D20-era header with no srcver and a short SEPApp64
+    hdr: dict  # _parse_sephdr64 output
+    srcver_major: int
+    apps_off: int  # first SEPApp64
+    n_apps: int
+    n_shlibs: int
+    stride: int  # bytes between SEPApp64 entries
+
+    @property
+    def is_legion64(self) -> bool:
+        """True for the iOS 16+ header, which has uuid_offset and astris_uuid."""
+        return self.marker_off == LEGION_MARKER_OFF
+
+    @property
+    def apps_end(self) -> int:
+        """First byte past the SEPApp64 array — the end of the header proper."""
+        return self.apps_off + self.stride * (self.n_apps + self.n_shlibs)
+
+
+def parse_legion_layout(data: bytes) -> LegionLayout | None:
+    """Resolve a ver >= 3 image's header layout, or None for anything older."""
+    marker_off = legion_marker_offset(data)
+    if marker_off is None:
+        raise ValueError("Unrecognised or 32-bit SEP firmware (not supported)")
+
+    hdr_offset, ver = find_off(data)
+    if ver < 3:
+        return None
+
+    is_old = hdr_offset == 0xFFFF
+    if is_old:
+        hdr_offset = 0x10F8
+
+    hdr = _parse_sephdr64(data, hdr_offset, ver, is_old)
+    apps_off = hdr["_apps_off"]
+    n_apps = hdr["n_apps"]
+    n_shlibs = hdr["n_shlibs"]
+
+    if n_apps == 0:
+        # 0x100 of padding sits between the header and the app array in some
+        # builds, and the real counts sit past it.
+        apps_off += 0x100
+        (n_apps,) = struct.unpack_from("<I", data, hdr_offset + 0x210)
+        (n_shlibs,) = struct.unpack_from("<I", data, hdr_offset + 0x214)
+
+    srcver_major = get_srcver_major(hdr["srcver"])
+    return LegionLayout(
+        marker_off=marker_off,
+        hdr_offset=hdr_offset,
+        ver=ver,
+        is_old=is_old,
+        hdr=hdr,
+        srcver_major=srcver_major,
+        apps_off=apps_off,
+        n_apps=n_apps,
+        n_shlibs=n_shlibs,
+        stride=_sepapp_stride(srcver_major, is_old),
+    )
+
+
+def kernel_phys_base(data: bytes, layout: LegionLayout) -> int:
+    """Firmware offset the kernel image starts at.
+
+    kern_ro_start — what kernel_base_paddr parses as — was that offset up to and
+    including iOS 26, where it reads 0x4000. iOS 27 widened the kernel's
+    read-only region to take in the boot page and the legion header, so there
+    the field reads 0 while the image itself still starts at 0x4000. Taken at
+    face value that maps the kernel over the header at address 0, and since the
+    view re-applies the boot-args struct there afterwards, the kernel's code
+    disappears rather than failing outright.
+
+    So believe the field only when it points past the header, and otherwise take
+    the first legion page after the header with anything in it.
+    """
+    kbase = layout.hdr["kernel_base_paddr"]
+    page_mask = LEGION64_PAGE_SIZE - 1
+    first_page = (layout.apps_end + page_mask) & ~page_mask
+    if kbase >= first_page:
+        return kbase
+    limit = min(layout.hdr["kernel_max_paddr"], len(data))
+    for off in range(first_page, limit, LEGION64_PAGE_SIZE):
+        if any(data[off : off + LEGION64_PAGE_SIZE]):
+            return off
+    return first_page
 
 
 def calc_size_raw(data: bytes) -> int:
@@ -324,33 +470,27 @@ def extract_all_modules(data: bytes) -> list[SepModule]:
     if ver == 1:
         raise ValueError("32-bit SEP firmware is not supported")
 
-    is_old = hdr_offset == 0xFFFF
-    if is_old:
-        hdr_offset = 0x10F8
-
     if ver == 2:
-        return _extract_ver2(data, hdr_offset)
+        return _extract_ver2(data, 0x10F8 if hdr_offset == 0xFFFF else hdr_offset)
 
-    hdr = _parse_sephdr64(data, hdr_offset, ver, is_old)
-    apps_off = hdr["_apps_off"]
-    n_apps = hdr["n_apps"]
-    n_shlibs = hdr["n_shlibs"]
+    layout = parse_legion_layout(data)
+    if layout is None:  # ver >= 3 always resolves; keeps the reads below honest
+        raise ValueError(f"unsupported SEP header version {ver}")
+    is_old = layout.is_old
+    hdr = layout.hdr
+    apps_off = layout.apps_off
+    n_apps = layout.n_apps
+    n_shlibs = layout.n_shlibs
+    srcver_major = layout.srcver_major
+    stride = layout.stride
 
-    if n_apps == 0:
-        apps_off += 0x100
-        n_apps = struct.unpack_from("<I", data, hdr_offset + 0x210)[0]
-        n_shlibs = struct.unpack_from("<I", data, hdr_offset + 0x214)[0]
-
-    kbase = hdr["kernel_base_paddr"]
+    kbase = kernel_phys_base(data, layout)
     kmax = hdr["kernel_max_paddr"]
 
     # Compute kernel size
     ksize = calc_size_raw(data[kbase:])
     if ksize == 0:
         ksize = kmax - kbase
-
-    srcver_major = get_srcver_major(hdr["srcver"])
-    stride = _sepapp_stride(srcver_major, is_old)
 
     modules: list[SepModule] = []
 
@@ -387,6 +527,7 @@ def extract_all_modules(data: bytes) -> list[SepModule]:
             is_macho=is_macho(data, kbase),
             is_shlib=False,
             binja_idx=0,  # shares the low address space with boot
+            srcver=hdr["srcver"],
         )
     )
 
@@ -409,6 +550,7 @@ def extract_all_modules(data: bytes) -> list[SepModule]:
             is_macho=is_macho(data, ibase),
             is_shlib=False,
             binja_idx=1,
+            srcver=hdr["srcver"],
         )
     )
 
@@ -430,6 +572,7 @@ def extract_all_modules(data: bytes) -> list[SepModule]:
                 is_macho=is_macho(data, app["phys_text"]),
                 is_shlib=False,
                 binja_idx=i + 2,
+                srcver=app["srcver"],
             )
         )
         off += stride
@@ -451,6 +594,7 @@ def extract_all_modules(data: bytes) -> list[SepModule]:
                 is_macho=is_macho(data, app["phys_text"]),
                 is_shlib=True,
                 binja_idx=n_apps + 2 + i,
+                srcver=app["srcver"],
             )
         )
         off += stride
